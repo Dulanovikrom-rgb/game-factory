@@ -1,0 +1,97 @@
+<!doctype html>
+<html>
+<head><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; connect-src 'none'; form-action 'none'; base-uri 'none'; object-src 'none'; frame-src 'none'">
+<title>Башенная Защита</title>
+<meta name="description" content="Простая яркая игра в жанре башенной защиты, где нужно тапать по врагам, чтобы не дать им добраться до базы.">
+<style>
+canvas { background: #87ceeb; display: block; margin: 0 auto; }
+</style>
+</head>
+<body>
+<canvas id="c" width="480" height="800"></canvas>
+<script>
+const c = document.getElementById('c');
+const ctx = c.getContext('2d');
+
+const base = { x: c.width/2, y: c.height-30, w:40, h:30, health:10 };
+let score = 0;
+let wave = 0;
+let speed = 2;
+let enemies = [];
+let lastSpawn = 0;
+const spawnInterval = 1200;
+
+const btn = { x:10, y:10, w:80, h:40 };
+
+function restartGame() {
+  base.health = 10;
+  score = 0;
+  wave = 0;
+  speed = 2;
+  enemies = [];
+  lastSpawn = 0;
+}
+
+function draw() {
+  ctx.clearRect(0,0,c.width,c.height);
+  ctx.fillStyle = '#ffcc00';
+  ctx.fillRect(base.x, base.y, base.w, base.h);
+  ctx.fillStyle = '#f00';
+  ctx.fillRect(base.x, base.y-10, base.w, 8);
+  ctx.fillStyle = '#0f0';
+  ctx.fillRect(base.x, base.y-10, base.w * (base.health/10), 8);
+  ctx.fillStyle = '#ff0000';
+  for(const e of enemies) {
+    ctx.beginPath();
+    ctx.arc(e.x, e.y, e.r, 0, Math.PI*2);
+    ctx.fill();
+  }
+  ctx.fillStyle = '#ff0';
+  ctx.fillRect(btn.x, btn.y, btn.w, btn.h);
+  ctx.fillStyle = '#000';
+  ctx.font = 'bold 14px sans-serif';
+  ctx.fillText('Перезапуск', btn.x+10, btn.y+25);
+  ctx.fillStyle = '#fff';
+  ctx.font = '20px sans-serif';
+  ctx.fillText('Очки: '+score, 10, 60);
+  ctx.fillText('Тапните по врагу', c.width/2-80, 40);
+}
+
+function update(ts) {
+  if (ts - lastSpawn > spawnInterval) {
+    if (wave % 5 === 0 && wave>0) speed += 0.5;
+    enemies.push({x: -20, y: base.y + Math.random()*base.h, r:12, speed: speed});
+    lastSpawn = ts;
+    wave++;
+  }
+  for(let i=enemies.length-1;i>=0;i--) {
+    const e = enemies[i];
+    e.x += e.speed;
+    if (e.x > c.width) { base.health--; enemies.splice(i,1); }
+  }
+  draw();
+  requestAnimationFrame(update);
+}
+
+c.addEventListener('click', e => {
+  const rect = c.getBoundingClientRect();
+  const mx = (e.clientX - rect.left) * (c.width / rect.width);
+  const my = (e.clientY - rect.top) * (c.height / rect.height);
+  if (mx >= btn.x && mx <= btn.x+btn.w && my >= btn.y && my <= btn.y+btn.h) {
+    restartGame();
+    draw();
+    return;
+  }
+  for(let i=enemies.length-1;i>=0;i--) {
+    const e = enemies[i];
+    const dx = e.x - mx;
+    const dy = e.y - my;
+    if (dx*dx + dy*dy <= e.r*e.r) { enemies.splice(i,1); score++; }
+  }
+});
+
+restartGame();
+requestAnimationFrame(update);
+</script>
+</body>
+</html>
