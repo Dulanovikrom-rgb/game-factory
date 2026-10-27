@@ -300,20 +300,22 @@ jobs:
 
           # ---------- жанры и память об играх ----------
           GENRES = [
-              ('Змейка', 'classic snake on a grid, on-screen arrow buttons, grows when eating food'),
-              ('Память', 'memory card matching game with emoji cards, count the moves'),
-              ('Лови падающее', 'catch falling items with a basket moved by touch, avoid bombs, 3 lives'),
-              ('Реакция', 'reaction test: tap as fast as possible when the screen changes colour, show best time'),
-              ('Кликер', 'idle clicker: tap a big button to earn coins, buy 3 upgrades'),
-              ('Тир', 'shooting gallery: tap moving targets of different sizes, 30 second round'),
-              ('Математика', 'fast arithmetic quiz, 10 questions with a timer and 4 answer buttons'),
-              ('Ритм-плитки', 'tap the dark tile in 4 columns, tiles fall faster over time'),
-              ('Прыжки', 'one-button runner: tap to jump over obstacles, score grows with distance'),
-              ('Сапёр', 'mini minesweeper 6x6 with a flag mode toggle button'),
-              ('Симон', 'Simon says: repeat a growing sequence with 4 big coloured buttons'),
-              ('Крестики-нолики', 'tic-tac-toe against a simple bot, score across rounds'),
-              ('Шарики', 'pop bubbles that float up, combo multiplier, 30 second round'),
-              ('Слова', 'unscramble Russian words, 10 simple words, hint button'),
+              # ---- для девочек ----
+              ('girls', 'Раскраска', 'colouring book: a simple cartoon picture (cat, flower, butterfly or house) made of big tappable regions; pick a colour from an 8-colour palette, tap a region to fill it; reset and next-picture buttons'),
+              ('girls', 'Украшение торта', 'decorate a birthday cake: choose frosting colour, then tap to place sprinkles, cherries, candles and stars from a sticker panel; undo and done buttons'),
+              ('girls', 'Украшение комнаты', 'decorate a cute room: tap furniture and decoration stickers from a panel to place them, change wall and floor colour; reset button'),
+              ('girls', 'Наряд для куклы', 'dress up a doll: tap to change hair, dress, shoes and accessories from simple coloured shapes; reset button'),
+              ('girls', 'Салон ногтей', 'nail salon: choose polish colour, pattern and gem stickers, then tap each of the 5 fingers to paint it; show a happy result screen, new-hand button'),
+              ('girls', 'Собери мороженое', 'ice cream shop: a customer shows an order (cone, 2-3 scoops, topping); tap the right items in order; score for each correct order, timer 60 seconds'),
+              ('girls', 'Покупки', 'shopping game: a customer list shows 3-4 items; tap the right items to put into the basket, do not exceed the budget; score per correct basket, 5 rounds'),
+              ('girls', 'Готовим еду', 'cooking game: make a pizza, burger or pancakes step by step by tapping ingredients in the order shown on a recipe card; serve it to the customer; several dishes'),
+              # ---- для мальчиков ----
+              ('boys', 'Гонки по трассе', 'top-down car racing on 3 lanes: tap left/right side of the screen to change lane, dodge cars, speed grows, score by distance'),
+              ('boys', 'Гонки с нитро', 'racing game: steer with left/right touch buttons, collect coins, tap a nitro button for a speed boost with a cooldown, avoid obstacles'),
+              ('boys', 'Космический шутер', 'space shooter: drag a finger to move the ship, it auto-fires, enemy ships come down in waves, 3 lives, cartoon style'),
+              ('boys', 'Тир', 'shooting gallery: tap moving targets of different sizes and speeds, bonus targets, 30 second round, best score'),
+              ('boys', 'Танки', 'tank battle: move the tank with two buttons and tap fire to shoot cartoon enemy tanks that move across the field, 3 lives'),
+              ('boys', 'Защита базы', 'tower defence: tap enemies approaching the base to shoot them before they reach it, base has health, waves get faster'),
           ]
 
           def recent_games():
@@ -330,19 +332,24 @@ jobs:
           def generate_game():
               key = secret('OPENROUTER_API_KEY')
               history = recent_games()
-              used = [g.get('genre') for g in history[:6]]
-              choices = [g for g in GENRES if g[0] not in used] or GENRES
-              genre, task = random.choice(choices)
+              last_audience = history[0].get('audience') if history else None
+              audience = 'boys' if last_audience == 'girls' else 'girls'
+              used = [g.get('genre') for g in history[:8]]
+              pool = [g for g in GENRES if g[0] == audience]
+              choices = [g for g in pool if g[1] not in used] or pool
+              _, genre, task = random.choice(choices)
               titles = [g.get('title', '') for g in history[:10] if g.get('title')]
-              print('Жанр:', genre, flush=True)
+              print('Аудитория:', audience, '| Жанр:', genre, flush=True)
 
               prompt = (
-                  'Create an original simple mobile HTML5 game. Russian interface. '
+                  'Create an original simple mobile HTML5 game for kids aged 5-12 (' + ('girls' if audience == 'girls' else 'boys') + '). Russian interface. '
+                  'Kid-friendly cartoon style, bright colours, big touch buttons, no blood, no realistic weapons. '
+                  'Make it original with its own name: no real brand names, trademarks or existing characters. '
                   'Game type: ' + task + '. '
                   'Touch controls, short instructions, restart button, score, short rounds. '
                   'ONE self-contained HTML file with inline CSS and JS only. '
                   'No external resources, no URLs, no network, no forms, no storage, no eval. '
-                  'HARD LIMIT: under 9000 characters in total, keep code compact. '
+                  'HARD LIMIT: under 12000 characters in total, keep code compact. '
                   'Put the game title in <title> and a one-sentence Russian description in '
                   '<meta name="description" content="...">. '
                   + ('Do not reuse the names of these existing games: ' + '; '.join(titles) + '. ' if titles else '') +
@@ -422,7 +429,7 @@ jobs:
                               {'role': 'assistant', 'content': raw_html},
                               {'role': 'user', 'content': 'The game failed automatic testing: ' + last_error +
                                '. Fix this problem and return the complete corrected HTML only (raw, starting with '
-                               '<!doctype html>), same rules, under 9000 characters.'},
+                               '<!doctype html>), same rules, under 12000 characters.'},
                           ]
                       else:
                           messages = base
@@ -438,6 +445,7 @@ jobs:
                   'title': obj['title'][:90],
                   'description': obj['description'][:450],
                   'genre': genre,
+                  'audience': audience,
                   'status': 'draft',
                   'created': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
               }
