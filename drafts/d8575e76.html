@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="ru">
+<head><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; connect-src 'none'; form-action 'none'; base-uri 'none'; object-src 'none'; frame-src 'none'">
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<meta name="description" content="Игра для детей, где выBuilder вкусные блюда пошагово, следуя рецепту">
+<title>Яркая Кухня</title>
+<style>
+  body { margin:0; padding:0; background:linear-gradient(135deg,#fff0f5,#e6ffe6); font-family:'Comic Sans MS',cursive,sans-serif; display:flex; flex-direction:column; align-items:center; justify-content:center; min-height:100vh; color:#d6336c; user-select:none; -webkit-tap-highlight-color:transparent; }
+  .game-box { width:95%; max-width:500px; background:#fff; border-radius:20px; box-shadow:0 10px 20px rgba(0,0,0,0.1); padding:15px; border:4px solid #ffc0cb; text-align:center; }
+  h1 { margin:5px 0; color:#ff69b4; font-size:1.5rem; }
+  .score-board { font-size:1.2rem; margin:10px 0; background:#fff0f5; padding:5px 15px; border-radius:15px; display:inline-block; }
+  .recipe-card { background:#fffbe6; border:2px dashed #ffa500; border-radius:15px; padding:15px; margin:10px 0; font-size:1.1rem; display:flex; align-items:center; justify-content:center; gap:10px; flex-wrap:wrap; }
+  .step { display:flex; align-items:center; gap:5px; padding:5px; border-radius:10px; transition:all 0.3s; }
+  .step.done { background:#c8e6c9; text-decoration:line-through; opacity:0.7; }
+  .step.active { background:#ffecb3; border:2px solid #ffa500; transform:scale(1.1); }
+  .next-ing { font-size:2rem; animation:bounce 1s infinite alternate; }
+  @keyframes bounce { from { transform:translateY(0); } to { transform:translateY(-5px); } }
+  .plate { width:150px; height:150px; background:#fff; border:4px solid #ddd; border-radius:50%; margin:10px auto; display:flex; align-items:center; justify-content:center; font-size:3rem; position:relative; overflow:hidden; }
+  .plate .food { position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); font-size:2.5rem; animation:dropIn 0.5s ease-out; }
+  @keyframes dropIn { from { transform:translate(-50%,-150%) scale(0.5); opacity:0; } to { transform:translate(-50%,-50%) scale(1); opacity:1; } }
+  .ingredients { display:grid; grid-template-columns:repeat(4,1fr); gap:10px; margin:10px 0; }
+  .ing-btn { background:#ffb6c1; color:white; border:none; border-radius:50%; width:60px; height:60px; font-size:1.5rem; cursor:pointer; box-shadow:0 4px 0 #c71585; transition:all 0.1s; display:flex; align-items:center; justify-content:center; }
+  .ing-btn:active { transform:translateY(4px); box-shadow:0 0 0 #c71585; }
+  .actions { margin-top:10px; }
+  .serve-btn, .restart-btn { background:#32cd32; color:white; border:none; border-radius:25px; padding:10px 20px; font-size:1.1rem; cursor:pointer; margin:5px; box-shadow:0 4px 0 #228b22; }
+  .serve-btn:active, .restart-btn:active { transform:translateY(4px); box-shadow:0 0 0 #228b22; }
+  .feedback { height:30px; margin:5px 0; font-size:1rem; }
+  .shake { animation:shake 0.5s; }
+  @keyframes shake { 0% {transform:translateX(0);} 25% {transform:translateX(-5px);} 50% {transform:translateX(5px);} 75% {transform:translateX(-5px);} 100% {transform:translateX(0);} }
+  .confetti { position:absolute; width:10px; height:10px; background:#ff69b4; animation:fall 1s linear forwards; }
+  @keyframes fall { to { transform:translateY(300px) rotate(360deg); opacity:0; } }
+</style>
+</head>
+<body>
+
+<div class="game-box">
+  <h1>Яркая Кухня</h1>
+  <div class="score-board">Очки: <span id="score">0</span></div>
+  
+  <div class="plate" id="plate"></div>
+  
+  <div class="recipe-card" id="recipe"></div>
+  
+  <div class="ingredients" id="ingredients"></div>
+  
+  <div class="feedback" id="feedback"></div>
+  
+  <div class="actions">
+    <button class="serve-btn" id="serveBtn" onclick="serve()">СЕРВИРОВАТЬ</button>
+    <button class="restart-btn" onclick="restart()">НАЧАЛО ЗАГРУЗКИ</button>
+  </div>
+</div>
+
+<script>
+const dishes = [
+  { name:"Пицца", ingredients:["🍞","🧀","🍅","🌿"], steps:["хлеб","сыр","томаты","базилик"] },
+  { name:"Бургер", ingredients:["🍞","🥬","🧀","🍅"], steps:["хлеб","капуста","сыр","томаты"] },
+  { name:"Блинчики", ingredients:["🥚","🧈","🍯","🍓"], steps:["яйца","масло","мед","ягоды"] }
+];
+let level=0, score=0, step=0;
+
+function init(){ loadLevel(); render(); }
+
+function loadLevel(){
+  step=0;
+  document.getElementById('plate').innerHTML='';
+  document.getElementById('feedback').textContent='';
+  if(level>=dishes.length){ level=0; score=0; }
+}
+
+function render(){
+  const d=dishes[level];
+  const rc=document.getElementById('recipe');
+  rc.innerHTML=d.name+':<br>';
+  d.steps.forEach((s,i)=>{
+    const div=document.createElement('div');
+    div.className='step'+(i===step?' active':'');
+    div.textContent=(i+1)+'. '+s;
+    rc.appendChild(div);
+  });
+  const ingBox=document.getElementById('ingredients');
+  ingBox.innerHTML='';
+  const used=new Set();
+  d.steps.forEach((s,i)=>{ used.add(s); });
+  // Add extra distractors
+  const extras=[...new Set(d.ingredients)].filter(x=>!used.has(getIngName(x))).slice(0,2);
+  const all=[...new Set(d.ingredients)];
+  extras.forEach(e=>{ if(!all.includes(e)) all.push(e); });
+  all.forEach(ing=>{
+    const btn=document.createElement('div');
+    btn.className='ing-btn';
+    btn.textContent=ing;
+    btn.onclick=()=>tapIngredient(ing);
+    ingBox.appendChild(btn);
+  });
+  renderPlate();
+}
+
+function getIngName(emoji){
+  const m={"🍞":"хлеб","🧀":"сыр","🍅":"томаты","🌿":"базилик","🥬":"капуста","🥚":"яйца","🧈":"масло","🍯":"мед","🍓":"ягоды"};
+  return m[emoji]||' ';
+}
+
+function renderPlate(){
+  const plate=document.getElementById('plate');
+  const food=plate.querySelector('.food');
+  if(!food){
+    const span=document.createElement('div');
+    span.className='food';
+    span.id='plateFood';
+    plate.appendChild(span);
+  } else { food.textContent=''; }
+}
+
+function tapIngredient(ing){
+  const d=dishes[level];
+  const expected=d.steps[step];
+  const ingName=getIngName(ing);
+  if(ingName===expected){
+    score+=10;
+    step++;
+    const plate=document.getElementById('plate');
+    const food=document.getElementById('plateFood');
+    food.textContent=ing;
+    food.style.left='50%'; food.style.top='50%';
+    food.style.transform='translate(-50%,-50%)';
+    food.classList.remove('shake');
+    void food.offsetWidth;
+    food.classList.add('shake');
+    showFeedback('Отличная еда! +10');
+    render();
+    if(step>=d.steps.length){
+      document.getElementById('serveBtn').disabled=false;
+      document.getElementById('serveBtn').style.opacity='1';
+    }
+  } else {
+    score=Math.max(0,score-5);
+    const plate=document.getElementById('plate');
+    plate.classList.remove('shake');
+    void plate.offsetWidth;
+    plate.classList.add('shake');
+    showFeedback('Надо尝试正確 ингредиент!');
+  }
+  document.getElementById('score').textContent=score;
+}
+
+function serve(){
+  if(step<dishes[level].steps.length) return;
+  score+=50;
+  level++;
+  step=0;
+  document.getElementById('serveBtn').disabled=true;
+  document.getElementById('serveBtn').style.opacity='0.5';
+  showFeedback('Спасибо! +50 Очков');
+  spawnConfetti();
+  setTimeout(loadLevel,1000);
+}
+
+function restart(){
+  level=0; score=0; step=0;
+  document.getElementById('score').textContent=0;
+  init();
+}
+
+function showFeedback(msg){
+  const fb=document.getElementById('feedback');
+  fb.textContent=msg;
+  fb.style.color='#32cd32';
+  setTimeout(()=>fb.style.color='#d6336c',1000);
+}
+
+function spawnConfetti(){
+  const colors=['#ff69b4','#ffd700','#32cd32','#1e90ff'];
+  for(let i=0;i<30;i++){
+    const c=document.createElement('div');
+    c.className='confetti';
+    c.style.left=Math.random()*100+'%';
+    c.style.background=colors[Math.floor(Math.random()*colors.length)];
+    c.style.animationDelay=Math.random()*0.5+'s';
+    c.style.animationDuration='1s';
+    document.body.appendChild(c);
+    setTimeout(()=>c.remove(),1200);
+  }
+}
+
+init();
+</script>
+</body>
+</html>
