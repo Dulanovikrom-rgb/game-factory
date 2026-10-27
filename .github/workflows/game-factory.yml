@@ -3,12 +3,12 @@ on:
   workflow_dispatch:
     inputs:
       command:
-        description: 'create — новая игра; publish — публикация одобренной игры'
+        description: 'create — новая игра; publish — одобрить файл и пост'
         type: choice
         options: [create, publish]
         default: create
       game_id:
-        description: 'Только для publish: ID игры из Telegram'
+        description: 'Только для publish: ID из Telegram'
         type: string
         default: ''
 permissions:
@@ -21,7 +21,7 @@ concurrency:
 jobs:
   factory:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 15
     environment:
       name: github-pages
       url: ${{ steps.deploy.outputs.page_url }}
@@ -41,72 +41,174 @@ jobs:
       - name: Prepare program
         run: |
           cat > /tmp/factory.py <<'PY'
-          import os,json,urllib.request,pathlib,secrets,re,time
-          P=pathlib.Path
-          TOKEN=os.environ['BOT_TOKEN']; OWNER=os.environ['OWNER_ID']
-          BASE=os.environ['SITE_URL'].rstrip('/')
-          def tg(method,data):
-           req=urllib.request.Request('https://api.telegram.org/bot'+TOKEN+'/'+method,data=json.dumps(data).encode(),headers={'Content-Type':'application/json'})
-           result=json.load(urllib.request.urlopen(req,timeout=60))
-           if not result.get('ok'): raise RuntimeError('Telegram request failed')
-           return result['result']
-          def say(text): tg('sendMessage',{'chat_id':OWNER,'text':text})
-          def document(path,caption):
-           boundary='----'+secrets.token_hex(16); body=b''
-           for k,v in {'chat_id':OWNER,'caption':caption}.items():
-            body+=f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode()
-           body+=f'--{boundary}\r\nContent-Disposition: form-data; name="document"; filename="game.html"\r\nContent-Type: text/html\r\n\r\n'.encode()+path.read_bytes()+f'\r\n--{boundary}--\r\n'.encode()
-           req=urllib.request.Request('https://api.telegram.org/bot'+TOKEN+'/sendDocument',data=body,headers={'Content-Type':'multipart/form-data; boundary='+boundary})
-           result=json.load(urllib.request.urlopen(req,timeout=60))
-           if not result.get('ok'): raise RuntimeError('Document delivery failed')
-          P('drafts').mkdir(exist_ok=True); P('site/games').mkdir(parents=True,exist_ok=True)
-          if not P('site/index.html').exists(): P('site/index.html').write_text('<!doctype html><meta charset="utf-8"><title>Игры</title><h1>Мои игры</h1>')
-          command=os.environ['COMMAND']; ident=os.environ.get('GAME_ID','').strip()
-          if command=='create':
-           prompt='Create an original complete mobile HTML5 game, not a maze. Russian UI, touch controls, score, restart, instructions, polished design. One self-contained HTML with inline CSS and JS. No external assets, URLs, networking, forms, storage, eval, navigation or payments. Return ONLY a JSON object with strings title, description, html. Vary mechanics. Never include Markdown.'
-           payload={'model':'openrouter/free','messages':[{'role':'user','content':prompt}],'max_tokens':12000}
-           req=urllib.request.Request('https://openrouter.ai/api/v1/chat/completions',data=json.dumps(payload).encode(),headers={'Content-Type':'application/json','Authorization':'Bearer '+os.environ['OPENROUTER_API_KEY']})
-           result=json.load(urllib.request.urlopen(req,timeout=240))
-           choice=result['choices'][0]
-           if choice.get('finish_reason')=='length': raise ValueError('Model output truncated; run create again')
-           text=choice['message']['content'].strip()
-           text=re.sub(r'^```(?:json)?\s*','',text); text=re.sub(r'\s*```$','',text)
-           obj=json.loads(text); html=obj['html']
-           if not isinstance(html,str) or len(html)>180000 or '<html' not in html.lower() or '<script' not in html.lower(): raise ValueError('Invalid HTML output')
-           policy="<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; connect-src 'none'; form-action 'none'; base-uri 'none'; object-src 'none'; frame-src 'none'\">"
-           html,count=re.subn(r'(<head[^>]*>)',lambda m:m[0]+policy,html,count=1,flags=re.I)
-           if count!=1: raise ValueError('No HTML head')
-           ident=secrets.token_hex(4)
-           meta={'title':str(obj['title'])[:90],'description':str(obj['description'])[:450],'status':'draft'}
-           P('drafts/'+ident+'.html').write_text(html)
-           P('drafts/'+ident+'.json').write_text(json.dumps(meta,ensure_ascii=False))
-           document(P('drafts/'+ident+'.html'),'Новая игра: '+meta['title']+'\n'+meta['description']+'\nID: '+ident+'\nПубликуем? Проверьте файл. В GitHub: Actions → Game Factory → Run workflow → publish и этот ID. Для другой игры выберите create. Это черновик: играбельность автоматически не проверена.')
-          elif command=='publish':
-           if not re.fullmatch('[a-f0-9]{8}',ident): raise ValueError('Enter the eight-character ID from Telegram')
-           meta=json.loads(P('drafts/'+ident+'.json').read_text())
-           if meta['status']!='draft': raise ValueError('This draft is not pending')
-           dest=P('site/games')/ident; dest.mkdir(exist_ok=True)
-           (dest/'index.html').write_bytes(P('drafts/'+ident+'.html').read_bytes())
-           meta['status']='approved'; P('drafts/'+ident+'.json').write_text(json.dumps(meta,ensure_ascii=False))
-          elif command=='notify':
-           if not re.fullmatch('[a-f0-9]{8}',ident): raise ValueError('Invalid ID')
-           path=P('drafts/'+ident+'.json'); meta=json.loads(path.read_text())
-           if meta['status']!='approved': raise ValueError('Not approved')
-           url=BASE+'/games/'+ident+'/'
-           for attempt in range(6):
-            try:
-             actual=urllib.request.urlopen(url,timeout=30).read()
-             if actual==P('drafts/'+ident+'.html').read_bytes(): break
-            except Exception: pass
-            time.sleep(10)
-           else: raise ValueError('Deployed file not confirmed; no post sent')
-           tg('sendMessage',{'chat_id':os.environ.get('CHANNEL_ID') or OWNER,'text':meta['title']+'\n\n'+meta['description']+'\n\nИграть: '+url})
-           meta['status']='published'; path.write_text(json.dumps(meta,ensure_ascii=False))
-          else: raise ValueError('Unknown command')
+          import os, json, re, time, secrets, pathlib, urllib.request, urllib.error, urllib.parse
+          P = pathlib.Path
+          COMMAND = os.environ.get('COMMAND', 'create')
+          GAME_ID = os.environ.get('GAME_ID', '').strip()
+          BASE = os.environ['SITE_URL'].rstrip('/')
+          
+          def secret(name):
+              value = os.environ.get(name, '').strip()
+              if not value:
+                  raise RuntimeError('Missing GitHub Actions secret: ' + name)
+              if not value.isascii() or any(c.isspace() for c in value):
+                  raise RuntimeError('Secret ' + name + ' contains spaces or non-ASCII characters. Paste only the actual key/ID.')
+              return value
+          
+          TOKEN = secret('BOT_TOKEN')
+          OWNER = secret('OWNER_ID')
+          if not re.fullmatch(r'\d+', OWNER):
+              raise RuntimeError('OWNER_ID must be your numeric Telegram user ID, not a username.')
+          
+          def request_json(url, data, headers=None, timeout=180):
+              req = urllib.request.Request(url, data=json.dumps(data).encode(), headers={'Content-Type': 'application/json', **(headers or {})})
+              try:
+                  with urllib.request.urlopen(req, timeout=timeout) as response:
+                      return json.load(response)
+              except urllib.error.HTTPError as error:
+                  # Do not print the URL, request headers, or body containing credentials.
+                  raise RuntimeError('HTTP ' + str(error.code) + ' from ' + urllib.parse.urlparse(url).hostname) from None
+          
+          def tg(method, data):
+              result = request_json('https://api.telegram.org/bot' + TOKEN + '/' + method, data, timeout=60)
+              if not result.get('ok'):
+                  raise RuntimeError('Telegram rejected operation: ' + method)
+              return result['result']
+          
+          def send_file(path, caption):
+              boundary = '----' + secrets.token_hex(16)
+              body = b''
+              for key, value in {'chat_id': OWNER, 'caption': caption}.items():
+                  body += f'--{boundary}\r\nContent-Disposition: form-data; name="{key}"\r\n\r\n{value}\r\n'.encode()
+              body += f'--{boundary}\r\nContent-Disposition: form-data; name="document"; filename="game.html"\r\nContent-Type: text/html\r\n\r\n'.encode()
+              body += path.read_bytes() + f'\r\n--{boundary}--\r\n'.encode()
+              req = urllib.request.Request('https://api.telegram.org/bot' + TOKEN + '/sendDocument', data=body, headers={'Content-Type': 'multipart/form-data; boundary=' + boundary})
+              try:
+                  with urllib.request.urlopen(req, timeout=60) as response:
+                      result = json.load(response)
+              except urllib.error.HTTPError as error:
+                  raise RuntimeError('Telegram sendDocument failed: HTTP ' + str(error.code) + '. Check BOT_TOKEN, OWNER_ID, and press Start in the bot.') from None
+              if not result.get('ok'):
+                  raise RuntimeError('Telegram could not deliver the HTML file.')
+          
+          def metadata_path():
+              if not re.fullmatch('[a-f0-9]{8}', GAME_ID):
+                  raise RuntimeError('Enter the eight-character game ID from Telegram in game_id.')
+              path = P('drafts') / (GAME_ID + '.json')
+              if not path.exists():
+                  raise RuntimeError('Game ID was not found in this repository.')
+              return path
+          
+          def load_game():
+              path = metadata_path()
+              return path, json.loads(path.read_text())
+          
+          def write_meta(path, obj):
+              path.write_text(json.dumps(obj, ensure_ascii=False, indent=2))
+          
+          P('drafts').mkdir(exist_ok=True)
+          P('site/games').mkdir(parents=True, exist_ok=True)
+          if not P('site/index.html').exists():
+              P('site/index.html').write_text('<!doctype html><html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Игры</title><h1>Игры</h1><p>Открывайте игры по ссылкам из Telegram.</p></html>')
+          
+          if COMMAND == 'create':
+              key = secret('OPENROUTER_API_KEY')
+              prompt = 'Create an original polished simple mobile HTML5 game, NOT a maze. Russian interface. Touch controls, clear instructions, restart, score, short rounds. One complete self-contained HTML, inline JS/CSS. No external resources, URLs, network requests, navigation, forms, storage, eval, payments. Keep HTML under 18000 characters. Return ONLY a JSON object with three string fields: title, description, html. No Markdown. Vary mechanics. Include html and head tags.'
+              payload = {'model': 'openrouter/free', 'messages': [{'role': 'user', 'content': prompt}], 'max_tokens': 12000}
+              obj = None
+              last_error = 'unknown'
+              for attempt in range(1, 4):
+                  print('Generation attempt', attempt, 'of 3', flush=True)
+                  try:
+                      result = request_json('https://openrouter.ai/api/v1/chat/completions', payload, {'Authorization': 'Bearer ' + key}, timeout=150)
+                      if result.get('error'):
+                          err = result['error']
+                          errcode = err.get('code', 'unknown') if isinstance(err, dict) else 'unknown'
+                          raise ValueError('Provider returned an error; code=' + str(errcode))
+                      choices = result.get('choices') or []
+                      if not choices:
+                          raise ValueError('No choices returned')
+                      choice = choices[0]
+                      reason = choice.get('finish_reason')
+                      message = choice.get('message') or {}
+                      content = message.get('content')
+                      if not isinstance(content, str) or not content.strip():
+                          raise ValueError('Empty model answer; finish_reason=' + str(reason))
+                      if reason in ('length', 'error', 'content_filter'):
+                          raise ValueError('Incomplete/refused answer; finish_reason=' + str(reason))
+                      text = re.sub(r'^```(?:json)?\s*', '', content.strip())
+                      text = re.sub(r'\s*```$', '', text)
+                      candidate = json.loads(text)
+                      if not isinstance(candidate, dict) or not all(isinstance(candidate.get(k), str) and candidate[k].strip() for k in ('title', 'description', 'html')):
+                          raise ValueError('Expected JSON string fields: title, description, html')
+                      html = candidate['html']
+                      if len(html) > 180000 or '<html' not in html.lower() or '<script' not in html.lower():
+                          raise ValueError('HTML missing or incomplete')
+                      policy = "<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; connect-src 'none'; form-action 'none'; base-uri 'none'; object-src 'none'; frame-src 'none'\">"
+                      html, count = re.subn(r'(<head[^>]*>)', lambda m: m[0] + policy, html, count=1, flags=re.I)
+                      if count != 1:
+                          raise ValueError('HTML head missing')
+                      candidate['html'] = html
+                      obj = candidate
+                      break
+                  except (ValueError, RuntimeError, TimeoutError, urllib.error.URLError) as error:
+                      if isinstance(error, json.JSONDecodeError):
+                          last_error = 'Model did not return valid JSON'
+                      elif isinstance(error, (TimeoutError, urllib.error.URLError)):
+                          last_error = 'Network timeout or connection failure'
+                      else:
+                          last_error = str(error)
+                      print('Attempt unsuccessful:', last_error, flush=True)
+                      if 'HTTP 401' in last_error or 'HTTP 403' in last_error or 'HTTP 402' in last_error:
+                          break
+                      if attempt < 3:
+                          time.sleep(8)
+              if obj is None:
+                  raise RuntimeError('No valid game generated. ' + last_error + '. Check OpenRouter quota/key/account access. Nothing published.')
+              ident = secrets.token_hex(4)
+              path = P('drafts') / (ident + '.html')
+              path.write_text(obj['html'])
+              meta = {'title': obj['title'][:90], 'description': obj['description'][:450], 'status': 'draft'}
+              write_meta(P('drafts') / (ident + '.json'), meta)
+              send_file(path, 'Новая игра: ' + meta['title'] + '\n' + meta['description'] + '\nID: ' + ident + '\nКак поступим: публикуем или создаём другую? Проверьте HTML. Одобрение: GitHub Actions → Run workflow → publish + ID. Для другой игры: create. Проверена структура, но не играбельность.')
+              print('Draft created:', ident, flush=True)
+          elif COMMAND == 'publish':
+              path, meta = load_game()
+              if meta.get('status') not in ('draft', 'approved'):
+                  raise RuntimeError('Already published or unavailable; check channel before retrying.')
+              destination = P('site/games') / GAME_ID
+              destination.mkdir(exist_ok=True)
+              (destination / 'index.html').write_bytes((P('drafts') / (GAME_ID + '.html')).read_bytes())
+              meta['status'] = 'approved'
+              write_meta(path, meta)
+          elif COMMAND == 'notify':
+              path, meta = load_game()
+              if meta.get('status') != 'approved':
+                  raise RuntimeError('Publication was not approved.')
+              url = BASE + '/games/' + GAME_ID + '/'
+              expected = (P('drafts') / (GAME_ID + '.html')).read_bytes()
+              confirmed = False
+              for attempt in range(6):
+                  try:
+                      with urllib.request.urlopen(url, timeout=20) as response:
+                          confirmed = response.read() == expected
+                  except (urllib.error.URLError, TimeoutError):
+                      pass
+                  if confirmed:
+                      break
+                  time.sleep(10)
+              if not confirmed:
+                  raise RuntimeError('Pages file not confirmed. No post sent. Check Pages deployment.')
+              channel = os.environ.get('CHANNEL_ID', '').strip() or OWNER
+              tg('sendMessage', {'chat_id': channel, 'text': meta['title'] + '\n\n' + meta['description'] + '\n\nИграть: ' + url})
+              meta['status'] = 'published'
+              write_meta(path, meta)
+          else:
+              raise RuntimeError('Unknown command')
           PY
       - name: Generate or approve
         run: python /tmp/factory.py
-      - name: Save files
+      - name: Save game files
         run: |
           git config user.name game-factory
           git config user.email game-factory@users.noreply.github.com
