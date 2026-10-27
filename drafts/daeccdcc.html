@@ -1,0 +1,70 @@
+<!doctype html><html><head><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; connect-src 'none'; form-action 'none'; base-uri 'none'; object-src 'none'; frame-src 'none'"><title>Эмодзи Память</title><meta name="description" content="Игра в пары с эмодзи: находите совпадения за минимум ходов."><style>
+body{font-family:sans-serif;display:flex;flex-direction:column;align-items:center;margin:0;padding:20px;background:#eef;user-select:none}
+#g{display:grid;grid-template-columns:repeat(4,70px);gap:8px;margin:10px 0}
+.c{width:70px;height:70px;background:#444;color:#fff;border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:2rem;cursor:pointer;transition:transform .3s,background .2s}
+.c.flip{transform:rotateY(180deg);background:#6a0}
+.c.matched{background:#080;cursor:default;pointer-events:none}
+#i{font-size:1.2rem;margin:10px}
+button{padding:10px 20px;font-size:1.1rem;cursor:pointer}
+</style></head><body>
+<div id="g"></div>
+<div id="i">Ходов: <span id="m">0</span> | Пар: <span id="p">0</span>/8</div>
+<button id="r">Новая игра</button>
+<script>
+const E=['😀','😂','😍','🤔','😎','🥳','😭','🤯'];
+const G=document.getElementById('g');
+const M=document.getElementById('m');
+const P=document.getElementById('p');
+const R=document.getElementById('r');
+let cards=[], first=null, pairs=0;
+
+function shuffle(arr){for(let i=arr.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[arr[i],arr[j]]=[arr[j],arr[i]]}}
+
+function init(){
+  G.innerHTML='';
+  cards=[...E,...E];
+  shuffle(cards);
+  pairs=0;
+  M.textContent=0;
+  P.textContent=0;
+  first=null;
+  cards.forEach((val, idx)=>{
+    const d=document.createElement('div');
+    d.className='c';
+    d.dataset.val=val;
+    d.addEventListener('click', clickHandler);
+    G.appendChild(d);
+  });
+}
+
+function clickHandler(e){
+  const c=e.currentTarget;
+  if(c.classList.contains('flip') || c.classList.contains('matched')) return;
+  c.classList.add('flip');
+  c.textContent=c.dataset.val;
+  if(!first){
+    first=c;
+  }else{
+    if(first.dataset.val===c.dataset.val){
+      first.classList.add('matched');
+      c.classList.add('matched');
+      pairs++;
+      P.textContent=pairs;
+      first=null;
+      if(pairs===8) setTimeout(()=>alert('Победа! Ходов: '+M.textContent),300);
+    }else{
+      setTimeout(()=>{
+        first.classList.remove('flip');
+        first.textContent='';
+        c.classList.remove('flip');
+        c.textContent='';
+        first=null;
+      },600);
+    }
+    M.textContent=parseInt(M.textContent)+1;
+  }
+}
+
+R.onclick=init;
+init();
+</script></body></html>
