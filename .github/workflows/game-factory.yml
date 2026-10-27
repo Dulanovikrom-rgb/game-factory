@@ -1,0 +1,133 @@
+name: Game Factory
+on:
+  workflow_dispatch:
+    inputs:
+      command:
+        description: 'create — новая игра; publish — публикация одобренной игры'
+        type: choice
+        options: [create, publish]
+        default: create
+      game_id:
+        description: 'Только для publish: ID игры из Telegram'
+        type: string
+        default: ''
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+concurrency:
+  group: game-factory
+  cancel-in-progress: false
+jobs:
+  factory:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    env:
+      BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+      OWNER_ID: ${{ secrets.OWNER_ID }}
+      CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      COMMAND: ${{ inputs.command }}
+      GAME_ID: ${{ inputs.game_id }}
+      SITE_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Prepare program
+        run: |
+          cat > /tmp/factory.py <<'PY'
+          import os,json,urllib.request,pathlib,secrets,re,time
+          P=pathlib.Path
+          TOKEN=os.environ['BOT_TOKEN']; OWNER=os.environ['OWNER_ID']
+          BASE=os.environ['SITE_URL'].rstrip('/')
+          def tg(method,data):
+           req=urllib.request.Request('https://api.telegram.org/bot'+TOKEN+'/'+method,data=json.dumps(data).encode(),headers={'Content-Type':'application/json'})
+           result=json.load(urllib.request.urlopen(req,timeout=60))
+           if not result.get('ok'): raise RuntimeError('Telegram request failed')
+           return result['result']
+          def say(text): tg('sendMessage',{'chat_id':OWNER,'text':text})
+          def document(path,caption):
+           boundary='----'+secrets.token_hex(16); body=b''
+           for k,v in {'chat_id':OWNER,'caption':caption}.items():
+            body+=f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode()
+           body+=f'--{boundary}\r\nContent-Disposition: form-data; name="document"; filename="game.html"\r\nContent-Type: text/html\r\n\r\n'.encode()+path.read_bytes()+f'\r\n--{boundary}--\r\n'.encode()
+           req=urllib.request.Request('https://api.telegram.org/bot'+TOKEN+'/sendDocument',data=body,headers={'Content-Type':'multipart/form-data; boundary='+boundary})
+           result=json.load(urllib.request.urlopen(req,timeout=60))
+           if not result.get('ok'): raise RuntimeError('Document delivery failed')
+          P('drafts').mkdir(exist_ok=True); P('site/games').mkdir(parents=True,exist_ok=True)
+          if not P('site/index.html').exists(): P('site/index.html').write_text('<!doctype html><meta charset="utf-8"><title>Игры</title><h1>Мои игры</h1>')
+          command=os.environ['COMMAND']; ident=os.environ.get('GAME_ID','').strip()
+          if command=='create':
+           prompt='Create an original complete mobile HTML5 game, not a maze. Russian UI, touch controls, score, restart, instructions, polished design. One self-contained HTML with inline CSS and JS. No external assets, URLs, networking, forms, storage, eval, navigation or payments. Return ONLY a JSON object with strings title, description, html. Vary mechanics. Never include Markdown.'
+           payload={'model':'openrouter/free','messages':[{'role':'user','content':prompt}],'max_tokens':12000}
+           req=urllib.request.Request('https://openrouter.ai/api/v1/chat/completions',data=json.dumps(payload).encode(),headers={'Content-Type':'application/json','Authorization':'Bearer '+os.environ['OPENROUTER_API_KEY']})
+           result=json.load(urllib.request.urlopen(req,timeout=240))
+           choice=result['choices'][0]
+           if choice.get('finish_reason')=='length': raise ValueError('Model output truncated; run create again')
+           text=choice['message']['content'].strip()
+           text=re.sub(r'^```(?:json)?\s*','',text); text=re.sub(r'\s*```$','',text)
+           obj=json.loads(text); html=obj['html']
+           if not isinstance(html,str) or len(html)>180000 or '<html' not in html.lower() or '<script' not in html.lower(): raise ValueError('Invalid HTML output')
+           policy="<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; connect-src 'none'; form-action 'none'; base-uri 'none'; object-src 'none'; frame-src 'none'\">"
+           html,count=re.subn(r'(<head[^>]*>)',lambda m:m[0]+policy,html,count=1,flags=re.I)
+           if count!=1: raise ValueError('No HTML head')
+           ident=secrets.token_hex(4)
+           meta={'title':str(obj['title'])[:90],'description':str(obj['description'])[:450],'status':'draft'}
+           P('drafts/'+ident+'.html').write_text(html)
+           P('drafts/'+ident+'.json').write_text(json.dumps(meta,ensure_ascii=False))
+           document(P('drafts/'+ident+'.html'),'Новая игра: '+meta['title']+'\n'+meta['description']+'\nID: '+ident+'\nПубликуем? Проверьте файл. В GitHub: Actions → Game Factory → Run workflow → publish и этот ID. Для другой игры выберите create. Это черновик: играбельность автоматически не проверена.')
+          elif command=='publish':
+           if not re.fullmatch('[a-f0-9]{8}',ident): raise ValueError('Enter the eight-character ID from Telegram')
+           meta=json.loads(P('drafts/'+ident+'.json').read_text())
+           if meta['status']!='draft': raise ValueError('This draft is not pending')
+           dest=P('site/games')/ident; dest.mkdir(exist_ok=True)
+           (dest/'index.html').write_bytes(P('drafts/'+ident+'.html').read_bytes())
+           meta['status']='approved'; P('drafts/'+ident+'.json').write_text(json.dumps(meta,ensure_ascii=False))
+          elif command=='notify':
+           if not re.fullmatch('[a-f0-9]{8}',ident): raise ValueError('Invalid ID')
+           path=P('drafts/'+ident+'.json'); meta=json.loads(path.read_text())
+           if meta['status']!='approved': raise ValueError('Not approved')
+           url=BASE+'/games/'+ident+'/'
+           for attempt in range(6):
+            try:
+             actual=urllib.request.urlopen(url,timeout=30).read()
+             if actual==P('drafts/'+ident+'.html').read_bytes(): break
+            except Exception: pass
+            time.sleep(10)
+           else: raise ValueError('Deployed file not confirmed; no post sent')
+           tg('sendMessage',{'chat_id':os.environ.get('CHANNEL_ID') or OWNER,'text':meta['title']+'\n\n'+meta['description']+'\n\nИграть: '+url})
+           meta['status']='published'; path.write_text(json.dumps(meta,ensure_ascii=False))
+          else: raise ValueError('Unknown command')
+          PY
+      - name: Generate or approve
+        run: python /tmp/factory.py
+      - name: Save files
+        run: |
+          git config user.name game-factory
+          git config user.email game-factory@users.noreply.github.com
+          git add drafts site
+          if ! git diff --cached --quiet; then
+            git commit -m "Update game factory"
+            git push
+          fi
+      - uses: actions/configure-pages@v5
+        if: inputs.command == 'publish'
+      - uses: actions/upload-pages-artifact@v3
+        if: inputs.command == 'publish'
+        with:
+          path: site
+      - uses: actions/deploy-pages@v4
+        id: deploy
+        if: inputs.command == 'publish'
+      - name: Send approved publication
+        if: inputs.command == 'publish'
+        run: |
+          COMMAND=notify python /tmp/factory.py
+          git add drafts
+          git commit -m "Record channel publication"
+          git push
