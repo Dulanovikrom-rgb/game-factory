@@ -1,13 +1,15 @@
 name: Game Factory
 
 on:
+  schedule:
+    - cron: '*/5 * * * *'   # каждые 5 минут проверяем сообщения боту
   workflow_dispatch:
     inputs:
       command:
-        description: 'create — новая игра; publish — одобрить и опубликовать'
+        description: 'auto — создать и сразу опубликовать; create — черновик на одобрение; publish — опубликовать черновик; listen — проверить сообщения'
         type: choice
-        options: [create, publish]
-        default: create
+        options: [auto, create, publish, listen]
+        default: auto
       game_id:
         description: 'Только для publish: 8-значный ID из Telegram'
         type: string
@@ -18,14 +20,88 @@ permissions:
   pages: write
   id-token: write
 
-concurrency:
-  group: game-factory
-  cancel-in-progress: false
-
 jobs:
-  factory:
+  # ---------------------------------------------------------------
+  # 1. Быстрая проверка: написал ли владелец боту «Генерируй»
+  # ---------------------------------------------------------------
+  check:
+    if: github.event_name == 'schedule' || inputs.command == 'listen'
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 3
+    permissions: {}
+    concurrency:
+      group: game-factory-listen
+      cancel-in-progress: false
+    outputs:
+      generate: ${{ steps.listen.outputs.generate }}
+    env:
+      BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+      OWNER_ID: ${{ secrets.OWNER_ID }}
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Check Telegram messages
+        id: listen
+        run: |
+          python - <<'PY'
+          import os, json, re, urllib.request
+
+          TOKEN = os.environ['BOT_TOKEN'].strip()
+          OWNER = os.environ['OWNER_ID'].strip()
+
+          def tg(method, data):
+              req = urllib.request.Request(
+                  'https://api.telegram.org/bot' + TOKEN + '/' + method,
+                  data=json.dumps(data).encode(),
+                  headers={'Content-Type': 'application/json'},
+              )
+              with urllib.request.urlopen(req, timeout=40) as response:
+                  return json.load(response)
+
+          generate = False
+          wrote_other = False
+
+          result = tg('getUpdates', {'timeout': 0, 'allowed_updates': ['message']})
+          updates = result.get('result', [])
+          print('Новых сообщений:', len(updates), flush=True)
+
+          if updates:
+              last = max(u['update_id'] for u in updates)
+              tg('getUpdates', {'offset': last + 1, 'timeout': 0, 'limit': 1})  # подтверждаем получение
+              for u in updates:
+                  m = u.get('message') or {}
+                  if str((m.get('from') or {}).get('id')) != OWNER:
+                      continue
+                  text = (m.get('text') or '').lower()
+                  if re.search(r'генер|созда[йё]|нов(ая|ую) игр|/new|/create|/generate', text):
+                      generate = True
+                  else:
+                      wrote_other = True
+
+          if generate:
+              tg('sendMessage', {'chat_id': OWNER,
+                                 'text': 'Принял! Создаю игру и проверяю её. Это займёт примерно 5–10 минут, потом опубликую в канале.'})
+          elif wrote_other:
+              tg('sendMessage', {'chat_id': OWNER,
+                                 'text': 'Напишите «Генерируй» — я создам игру и опубликую её в канале.'})
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write('generate=' + ('true' if generate else 'false') + '\n')
+          PY
+
+  # ---------------------------------------------------------------
+  # 2. Фабрика: генерация, проверка, публикация
+  # ---------------------------------------------------------------
+  factory:
+    needs: check
+    if: ${{ !cancelled() && (needs.check.outputs.generate == 'true' || (github.event_name == 'workflow_dispatch' && inputs.command != 'listen')) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    concurrency:
+      group: game-factory
+      cancel-in-progress: false
     environment:
       name: github-pages
       url: ${{ steps.deploy.outputs.page_url }}
@@ -34,7 +110,7 @@ jobs:
       OWNER_ID: ${{ secrets.OWNER_ID }}
       CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
       OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-      COMMAND: ${{ inputs.command }}
+      COMMAND: ${{ (github.event_name == 'schedule' || inputs.command == 'listen') && 'auto' || inputs.command }}
       GAME_ID: ${{ inputs.game_id }}
       SITE_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}
     steps:
@@ -44,16 +120,26 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: Install browser for game test
+        if: env.COMMAND == 'create' || env.COMMAND == 'auto'
+        continue-on-error: true
+        run: |
+          pip install playwright
+          python -m playwright install --with-deps chromium
+
       - name: Write factory program
         run: |
           cat > /tmp/factory.py <<'PY'
-          import os, json, re, time, secrets, pathlib, html as htmllib
+          import os, json, re, time, secrets, random, pathlib, html as htmllib
           import urllib.request, urllib.error, urllib.parse
 
           P = pathlib.Path
-          COMMAND = os.environ.get('COMMAND', 'create')
-          GAME_ID = os.environ.get('GAME_ID', '').strip().lower()
+          COMMAND = os.environ.get('COMMAND', 'auto')
+          GAME_ID = (os.environ.get('GAME_ID', '') or os.environ.get('GENERATED_ID', '')).strip().lower()
           BASE = os.environ['SITE_URL'].rstrip('/')
+
+          class FixableError(ValueError):
+              pass
 
           # ---------- секреты ----------
           def secret(name):
@@ -80,7 +166,6 @@ jobs:
                   with urllib.request.urlopen(req, timeout=timeout) as response:
                       return json.load(response)
               except urllib.error.HTTPError as error:
-                  # URL, заголовки и тело не печатаем: там могут быть ключи.
                   raise RuntimeError('HTTP ' + str(error.code) + ' from ' + urllib.parse.urlparse(url).hostname) from None
 
           def tg(method, data):
@@ -114,7 +199,7 @@ jobs:
           # ---------- файлы игр ----------
           def load_game():
               if not re.fullmatch(r'[a-f0-9]{8}', GAME_ID):
-                  raise RuntimeError('Введите 8-значный ID игры из Telegram в поле game_id.')
+                  raise RuntimeError('Нужен 8-значный ID игры из Telegram (поле game_id).')
               path = P('drafts') / (GAME_ID + '.json')
               if not path.exists() or not (P('drafts') / (GAME_ID + '.html')).exists():
                   raise RuntimeError('Игра с таким ID не найдена в репозитории.')
@@ -144,12 +229,20 @@ jobs:
                   'li{margin:14px 0}</style></head><body><h1>Игры</h1><ul>' + rows + '</ul></body></html>'
               )
 
+          def publish_files(ident, meta_path, meta):
+              destination = P('site/games') / ident
+              destination.mkdir(parents=True, exist_ok=True)
+              (destination / 'index.html').write_bytes((P('drafts') / (ident + '.html')).read_bytes())
+              meta['status'] = 'approved'
+              write_meta(meta_path, meta)
+              rebuild_index()
+
           # ---------- проверка HTML от модели ----------
           FORBIDDEN = [
               'http://', 'https://', '//cdn', 'eval(', 'new function', 'fetch(', 'xmlhttprequest',
               'websocket', 'localstorage', 'sessionstorage', 'indexeddb', 'document.cookie',
-              'window.open', 'location.href', 'location.replace', 'location.assign', 'importscripts', 'navigator.sendbeacon',
-              '<form', '<iframe', '<link', '<embed', '<object',
+              'window.open', 'location.href', 'location.replace', 'location.assign', 'importscripts',
+              'navigator.sendbeacon', '<form', '<iframe', '<link', '<embed', '<object',
           ]
 
           def validate_html(html):
@@ -157,54 +250,125 @@ jobs:
                   raise ValueError('HTML слишком большой')
               low = html.lower()
               if '<html' not in low or '<head' not in low or '<script' not in low:
-                  raise ValueError('В HTML нет html/head/script')
+                  raise FixableError('В HTML нет html/head/script')
               if re.search(r'<script[^>]+src\s*=', low):
-                  raise ValueError('Внешний script запрещён')
-              checked = low.replace('http://www.w3.org/', '')  # namespace у inline SVG допустим
+                  raise FixableError('Внешний script запрещён')
+              checked = low.replace('http://www.w3.org/', '')
               for bad in FORBIDDEN:
                   if bad in checked:
-                      raise ValueError('Запрещённая конструкция в HTML: ' + bad)
+                      raise FixableError('Запрещённая конструкция в HTML: ' + bad)
 
           CSP = ("<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; "
                  "script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; "
                  "connect-src 'none'; form-action 'none'; base-uri 'none'; object-src 'none'; frame-src 'none'\">")
 
-          P('drafts').mkdir(exist_ok=True)
-          P('site/games').mkdir(parents=True, exist_ok=True)
+          # ---------- тест игры в настоящем браузере ----------
+          def smoke_test(html):
+              try:
+                  from playwright.sync_api import sync_playwright
+              except ImportError:
+                  print('Тест в браузере пропущен: Playwright не установлен', flush=True)
+                  return
+              tmp = P('/tmp/smoke.html')
+              tmp.write_text(html)
+              errors = []
+              try:
+                  with sync_playwright() as pw:
+                      browser = pw.chromium.launch()
+                      ctx = browser.new_context(viewport={'width': 390, 'height': 780}, has_touch=True, is_mobile=True)
+                      page = ctx.new_page()
+                      page.on('pageerror', lambda e: errors.append(str(e)))
+                      page.on('console', lambda m: errors.append(m.text) if m.type == 'error' else None)
+                      page.goto('file://' + str(tmp))
+                      page.wait_for_timeout(1200)
+                      before = page.screenshot()
+                      for x in range(40, 360, 55):
+                          for y in range(100, 720, 70):
+                              page.touchscreen.tap(x, y)
+                              page.wait_for_timeout(25)
+                      page.wait_for_timeout(600)
+                      after = page.screenshot()
+                      browser.close()
+              except Exception as error:
+                  print('Тест в браузере не выполнен:', str(error)[:150], flush=True)
+                  return
+              if errors:
+                  raise FixableError('Ошибка JS в игре: ' + errors[0][:150])
+              if before == after:
+                  raise FixableError('Игра не реагирует: экран не изменился после нажатий')
+              print('Тест в браузере пройден', flush=True)
 
-          # =========================================================
-          if COMMAND == 'create':
+          # ---------- жанры и память об играх ----------
+          GENRES = [
+              ('Змейка', 'classic snake on a grid, on-screen arrow buttons, grows when eating food'),
+              ('Память', 'memory card matching game with emoji cards, count the moves'),
+              ('Лови падающее', 'catch falling items with a basket moved by touch, avoid bombs, 3 lives'),
+              ('Реакция', 'reaction test: tap as fast as possible when the screen changes colour, show best time'),
+              ('Кликер', 'idle clicker: tap a big button to earn coins, buy 3 upgrades'),
+              ('Тир', 'shooting gallery: tap moving targets of different sizes, 30 second round'),
+              ('Математика', 'fast arithmetic quiz, 10 questions with a timer and 4 answer buttons'),
+              ('Ритм-плитки', 'tap the dark tile in 4 columns, tiles fall faster over time'),
+              ('Прыжки', 'one-button runner: tap to jump over obstacles, score grows with distance'),
+              ('Сапёр', 'mini minesweeper 6x6 with a flag mode toggle button'),
+              ('Симон', 'Simon says: repeat a growing sequence with 4 big coloured buttons'),
+              ('Крестики-нолики', 'tic-tac-toe against a simple bot, score across rounds'),
+              ('Шарики', 'pop bubbles that float up, combo multiplier, 30 second round'),
+              ('Слова', 'unscramble Russian words, 10 simple words, hint button'),
+          ]
+
+          def recent_games():
+              items = []
+              for meta_path in P('drafts').glob('*.json'):
+                  try:
+                      items.append(json.loads(meta_path.read_text()))
+                  except Exception:
+                      continue
+              items.sort(key=lambda m: m.get('created', ''), reverse=True)
+              return items
+
+          # ---------- генерация ----------
+          def generate_game():
               key = secret('OPENROUTER_API_KEY')
+              history = recent_games()
+              used = [g.get('genre') for g in history[:6]]
+              choices = [g for g in GENRES if g[0] not in used] or GENRES
+              genre, task = random.choice(choices)
+              titles = [g.get('title', '') for g in history[:10] if g.get('title')]
+              print('Жанр:', genre, flush=True)
+
               prompt = (
-                  'Create an original simple mobile HTML5 game (NOT a maze). Russian interface. '
+                  'Create an original simple mobile HTML5 game. Russian interface. '
+                  'Game type: ' + task + '. '
                   'Touch controls, short instructions, restart button, score, short rounds. '
                   'ONE self-contained HTML file with inline CSS and JS only. '
                   'No external resources, no URLs, no network, no forms, no storage, no eval. '
                   'HARD LIMIT: under 9000 characters in total, keep code compact. '
                   'Put the game title in <title> and a one-sentence Russian description in '
                   '<meta name="description" content="...">. '
+                  + ('Do not reuse the names of these existing games: ' + '; '.join(titles) + '. ' if titles else '') +
                   'Return ONLY the raw HTML, starting with <!doctype html>. No JSON, no Markdown, no explanations.'
               )
-              payload = {'model': 'openrouter/free',
-                         'messages': [{'role': 'user', 'content': prompt}],
-                         'max_tokens': 12000,
-                         'reasoning': {'effort': 'low'}}
+              base = [{'role': 'user', 'content': prompt}]
+              messages = base
               obj = None
               last_error = 'unknown'
 
-              for attempt in range(1, 5):
-                  print('Попытка генерации', attempt, 'из 4', flush=True)
+              for attempt in range(1, 6):
+                  print('Попытка генерации', attempt, 'из 5', flush=True)
+                  raw_html = None
                   try:
+                      payload = {'model': 'openrouter/free', 'messages': messages,
+                                 'max_tokens': 12000, 'reasoning': {'effort': 'low'}}
                       result = request_json('https://openrouter.ai/api/v1/chat/completions', payload,
                                             {'Authorization': 'Bearer ' + key}, timeout=150)
                       if result.get('error'):
                           err = result['error']
                           code = err.get('code', 'unknown') if isinstance(err, dict) else 'unknown'
                           raise ValueError('Провайдер вернул ошибку; code=' + str(code))
-                      choices = result.get('choices') or []
-                      if not choices:
+                      choices_resp = result.get('choices') or []
+                      if not choices_resp:
                           raise ValueError('Нет choices в ответе')
-                      choice = choices[0]
+                      choice = choices_resp[0]
                       reason = choice.get('finish_reason')
                       content = (choice.get('message') or {}).get('content')
                       if not isinstance(content, str) or not content.strip():
@@ -212,7 +376,7 @@ jobs:
                       if reason in ('length', 'error', 'content_filter'):
                           raise ValueError('Ответ неполный или отклонён; finish_reason=' + str(reason))
 
-                      print('Ответ получен: символов =', len(content), ', finish_reason =', reason, flush=True)
+                      print('Ответ получен: символов =', len(content), flush=True)
                       html = content.strip()
                       m = re.search(r'```(?:html)?\s*(.*?)```', html, flags=re.S | re.I)
                       if m:
@@ -224,15 +388,21 @@ jobs:
                           html = html[start:]
                       if '</html>' not in html.lower():
                           raise ValueError('HTML оборван: нет закрывающего </html>')
-                      validate_html(html)
-                      t = re.search(r'<title[^>]*>(.*?)</title>', html, flags=re.S | re.I)
-                      d = re.search(r'<meta[^>]+name=["\']description["\'][^>]+content=["\'](.*?)["\']', html, flags=re.S | re.I)
+                      raw_html = html
+                      validate_html(raw_html)
+
+                      t = re.search(r'<title[^>]*>(.*?)</title>', raw_html, flags=re.S | re.I)
+                      d = re.search(r'<meta[^>]+name=["\']description["\'][^>]+content=["\'](.*?)["\']', raw_html, flags=re.S | re.I)
                       title = htmllib.unescape(t.group(1)).strip() if t else ''
                       desc = htmllib.unescape(d.group(1)).strip() if d else ''
-                      html, count = re.subn(r'(<head[^>]*>)', lambda mm: mm[0] + CSP, html, count=1, flags=re.I)
+
+                      final_html, count = re.subn(r'(<head[^>]*>)', lambda mm: mm[0] + CSP, raw_html, count=1, flags=re.I)
                       if count != 1:
                           raise ValueError('Не найден тег head')
-                      obj = {'title': title or 'Новая игра', 'description': desc or 'Простая мини-игра.', 'html': html}
+
+                      smoke_test(final_html)
+
+                      obj = {'title': title or 'Новая игра', 'description': desc or 'Простая мини-игра.', 'html': final_html}
                       break
 
                   except (ValueError, RuntimeError, TimeoutError, urllib.error.URLError) as error:
@@ -244,44 +414,62 @@ jobs:
                           last_error = str(error)
                       print('Неудача:', last_error, flush=True)
                       if any(c in last_error for c in ('HTTP 401', 'HTTP 402', 'HTTP 403')):
-                          break  # повтор не поможет: ключ/квота/доступ
-                      if attempt < 4:
-                          time.sleep(20 if 'HTTP 429' in last_error else 8)
+                          break
+                      if isinstance(error, FixableError) and raw_html:
+                          # просим модель исправить именно эту ошибку, а не начинаем с нуля
+                          print('Просим модель исправить ошибку', flush=True)
+                          messages = base + [
+                              {'role': 'assistant', 'content': raw_html},
+                              {'role': 'user', 'content': 'The game failed automatic testing: ' + last_error +
+                               '. Fix this problem and return the complete corrected HTML only (raw, starting with '
+                               '<!doctype html>), same rules, under 9000 characters.'},
+                          ]
+                      else:
+                          messages = base
+                      if attempt < 5:
+                          time.sleep(20 if 'HTTP 429' in last_error else 5)
 
               if obj is None:
-                  raise RuntimeError('Игра не создана. ' + last_error +
-                                     '. Проверьте ключ/квоту OpenRouter. Ничего не опубликовано.')
+                  raise RuntimeError('Игра не создана. ' + last_error + '. Ничего не опубликовано.')
 
               ident = secrets.token_hex(4)
-              html_path = P('drafts') / (ident + '.html')
-              html_path.write_text(obj['html'])
+              (P('drafts') / (ident + '.html')).write_text(obj['html'])
               meta = {
-                  'title': obj['title'].strip()[:90],
-                  'description': obj['description'].strip()[:450],
+                  'title': obj['title'][:90],
+                  'description': obj['description'][:450],
+                  'genre': genre,
                   'status': 'draft',
                   'created': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
               }
-              write_meta(P('drafts') / (ident + '.json'), meta)
-              send_file(html_path,
-                        'Новая игра: ' + meta['title'] + '\n' + meta['description'] + '\n\nID: ' + ident +
-                        '\n\nПубликовать: GitHub → Actions → Game Factory → Run workflow → publish + этот ID.'
-                        '\nДругую игру: create.\nПроверена структура, играбельность — нет.')
-              print('Черновик создан:', ident, flush=True)
+              meta_path = P('drafts') / (ident + '.json')
+              write_meta(meta_path, meta)
+              return ident, meta_path, meta
+
+          P('drafts').mkdir(exist_ok=True)
+          P('site/games').mkdir(parents=True, exist_ok=True)
 
           # =========================================================
+          if COMMAND == 'create':
+              ident, meta_path, meta = generate_game()
+              send_file(P('drafts') / (ident + '.html'),
+                        'Новая игра: ' + meta['title'] + '\n' + meta['description'] + '\n\nID: ' + ident +
+                        '\n\nПубликовать: GitHub → Actions → Game Factory → Run workflow → publish + этот ID.')
+              print('Черновик создан:', ident, flush=True)
+
+          elif COMMAND == 'auto':
+              ident, meta_path, meta = generate_game()
+              publish_files(ident, meta_path, meta)
+              with open(os.environ['GITHUB_ENV'], 'a') as f:
+                  f.write('GENERATED_ID=' + ident + '\n')
+              print('Игра создана и одобрена:', ident, flush=True)
+
           elif COMMAND == 'publish':
               path, meta = load_game()
               if meta.get('status') not in ('draft', 'approved'):
                   raise RuntimeError('Игра уже опубликована или недоступна. Проверьте канал.')
-              destination = P('site/games') / GAME_ID
-              destination.mkdir(parents=True, exist_ok=True)
-              (destination / 'index.html').write_bytes((P('drafts') / (GAME_ID + '.html')).read_bytes())
-              meta['status'] = 'approved'
-              write_meta(path, meta)
-              rebuild_index()
+              publish_files(GAME_ID, path, meta)
               print('Игра одобрена:', GAME_ID, flush=True)
 
-          # =========================================================
           elif COMMAND == 'notify':
               path, meta = load_game()
               if meta.get('status') != 'approved':
@@ -289,7 +477,7 @@ jobs:
               url = BASE + '/games/' + GAME_ID + '/'
               expected = (P('drafts') / (GAME_ID + '.html')).read_bytes()
               confirmed = False
-              for _ in range(8):
+              for _ in range(10):
                   try:
                       with urllib.request.urlopen(url, timeout=20) as response:
                           confirmed = response.read() == expected
@@ -299,10 +487,12 @@ jobs:
                       break
                   time.sleep(10)
               if not confirmed:
-                  raise RuntimeError('Файл на Pages не подтверждён. Пост не отправлен. Проверьте деплой Pages и повторите publish.')
+                  raise RuntimeError('Файл на Pages не подтверждён. Пост не отправлен. Проверьте деплой Pages.')
               channel = os.environ.get('CHANNEL_ID', '').strip() or OWNER
               tg('sendMessage', {'chat_id': channel,
                                  'text': meta['title'] + '\n\n' + meta['description'] + '\n\nИграть: ' + url})
+              if channel != OWNER:
+                  tg('sendMessage', {'chat_id': OWNER, 'text': 'Готово! Игра «' + meta['title'] + '» опубликована в канале:\n' + url})
               meta['status'] = 'published'
               write_meta(path, meta)
               print('Пост отправлен:', url, flush=True)
@@ -320,29 +510,36 @@ jobs:
           git config user.email game-factory@users.noreply.github.com
           git add drafts site
           if ! git diff --cached --quiet; then
-            git commit -m "Game factory: ${{ inputs.command }} ${{ inputs.game_id }}"
+            git commit -m "Game factory: $COMMAND ${GENERATED_ID:-$GAME_ID}"
             git push
           fi
 
       - uses: actions/configure-pages@v5
-        if: inputs.command == 'publish'
+        if: env.COMMAND == 'publish' || env.COMMAND == 'auto'
 
       - uses: actions/upload-pages-artifact@v3
-        if: inputs.command == 'publish'
+        if: env.COMMAND == 'publish' || env.COMMAND == 'auto'
         with:
           path: site
 
       - name: Deploy to Pages
         id: deploy
-        if: inputs.command == 'publish'
+        if: env.COMMAND == 'publish' || env.COMMAND == 'auto'
         uses: actions/deploy-pages@v4
 
       - name: Post to channel
-        if: inputs.command == 'publish'
+        if: env.COMMAND == 'publish' || env.COMMAND == 'auto'
         run: |
           COMMAND=notify python /tmp/factory.py
           git add drafts
           if ! git diff --cached --quiet; then
-            git commit -m "Game factory: published ${{ inputs.game_id }}"
+            git commit -m "Game factory: published ${GENERATED_ID:-$GAME_ID}"
             git push
           fi
+
+      - name: Tell owner about failure
+        if: failure() && env.COMMAND == 'auto'
+        run: |
+          curl -sS -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${OWNER_ID}" \
+            --data-urlencode "text=Не получилось создать игру. Напишите «Генерируй» ещё раз. Подробности: GitHub → Actions." > /dev/null || true
